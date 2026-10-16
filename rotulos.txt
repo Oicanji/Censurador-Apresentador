@@ -1,0 +1,5 @@
+denunciante
+denunciado
+interessado
+interessados
+atual
