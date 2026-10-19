@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CRM SC/RS - Censurador Apresentador
 // @namespace    censurador-apresentador
-// @version      1.2.0
+// @version      1.6.1
 // @description  Censura dados sensíveis e cobre a tela com marca d'água da GBR
 // @match        https://apps.crmsc.org.br/*
 // @match        https://crvirtual-hml.crmsc.org.br/*
@@ -13,7 +13,7 @@
 // @run-at       document-idle
 // ==/UserScript==
 
-const MARCA_DAGUA = true;
+const MARCA_DAGUA = false;
 
 (function () {
   "use strict";
@@ -34,10 +34,16 @@ const MARCA_DAGUA = true;
 
   const MARCA_ID = "gbr-ap-marca";
   const ACAO_BLUR = "abnt-pasta-acao";
+  const CLASSE_CAMPO = "abnt-campo-censura";
+  const CLASSE_MASCARA = "abnt-campo-ast";
   const pastasSemBlur = new WeakSet();
 
   const originaisTexto = new WeakMap();
-  const originaisCampo = new WeakMap();
+  const mascarasCampo = new WeakMap();
+  const coresCampo = new WeakMap();
+  const camposMascarados = new Set();
+  let aplicandoCampo = false;
+  let loopOn = false;
 
   function semAcento(s) {
     return String(s || "")
@@ -61,16 +67,33 @@ const MARCA_DAGUA = true;
     return partes.join("");
   }
 
+  function mascararDocumento(s) {
+    const texto = String(s);
+    let n = 0;
+    for (let i = 0; i < texto.length; i++) {
+      if (/\d/.test(texto.charAt(i))) n += 1;
+    }
+    if (!n) return texto;
+    let idx = 0;
+    let saida = "";
+    for (let i = 0; i < texto.length; i++) {
+      const ch = texto.charAt(i);
+      if (!/\d/.test(ch)) {
+        saida += ch;
+        continue;
+      }
+      saida += idx < 3 || idx >= n - 3 ? "*" : ch;
+      idx += 1;
+    }
+    return saida;
+  }
+
   function mascararCpf(num) {
-    const m = String(num).match(/^(\d{3})(\.)(\d{3})(\.)(\d{3})(-?)(\d{2})$/);
-    if (!m) return mascararAlnum(num);
-    return "***" + m[2] + m[3] + m[4] + m[5] + m[6] + "**";
+    return mascararDocumento(num);
   }
 
   function mascararCnpj(num) {
-    const m = String(num).match(/^(\d{2}\.\d{3}\.\d{3})\/\d{4}-\d{2}$/);
-    if (!m) return mascararAlnum(num);
-    return m[1] + "/XXXX-XX";
+    return mascararDocumento(num);
   }
 
   function rotuloBate(texto) {
@@ -136,6 +159,34 @@ const MARCA_DAGUA = true;
     );
   }
 
+  function rotuloLabelAncestral(el) {
+    let node = el;
+    for (let d = 0; d < 8 && node; d++) {
+      const pai = node.parentElement;
+      if (!pai || pai === document.body || pai === document.documentElement)
+        break;
+      let prev = node.previousElementSibling;
+      for (let i = 0; i < 4 && prev; i++) {
+        if (prev.tagName === "LABEL") {
+          const t = textoDe(prev);
+          if (t.trim()) return t;
+        }
+        const filho = prev.firstElementChild;
+        if (
+          filho &&
+          filho === prev.lastElementChild &&
+          filho.tagName === "LABEL"
+        ) {
+          const t = textoDe(filho);
+          if (t.trim()) return t;
+        }
+        prev = prev.previousElementSibling;
+      }
+      node = pai;
+    }
+    return "";
+  }
+
   function acharRotulo(el) {
     if (!el || el.nodeType !== 1) return "";
     const aria = el.getAttribute("aria-label");
@@ -164,6 +215,8 @@ const MARCA_DAGUA = true;
       );
       if (lab) return textoDe(lab);
     }
+    const labelPerto = rotuloLabelAncestral(el);
+    if (labelPerto) return labelPerto;
     let prev = el.previousElementSibling;
     for (let i = 0; i < 4 && prev; i++) {
       const t = textoDe(prev);
@@ -213,10 +266,216 @@ const MARCA_DAGUA = true;
     return rotuloBate(acharRotulo(el));
   }
 
-  function mascararValor(el, bruto) {
-    let s = String(bruto);
-    if (contextoSensivel(el)) s = mascararNPalavras(s, 3);
-    return censurarTexto(s);
+  function labelDeCampoSensivel(rotulo) {
+    if (rotuloBate(rotulo)) return true;
+    const t = semAcento(rotulo);
+    return t.indexOf("cpf") !== -1 || t.indexOf("cnpj") !== -1;
+  }
+
+  function rotuloVisivel(el) {
+    const direto = acharRotulo(el);
+    if (direto && direto.trim()) return direto;
+    let node = el;
+    for (let d = 0; d < 8 && node && node.parentElement; d++) {
+      const pai = node.parentElement;
+      if (pai === document.body || pai === document.documentElement) break;
+      let prev = node.previousElementSibling;
+      for (let i = 0; i < 4 && prev; i++) {
+        const t = String(prev.innerText || prev.textContent || "")
+          .replace(/\s+/g, " ")
+          .trim();
+        if (t && t.length < 80) return t;
+        prev = prev.previousElementSibling;
+      }
+      node = pai;
+    }
+    return "";
+  }
+
+  function pareceMascaraCpfCnpj(s) {
+    const t = String(s || "").trim();
+    if (!/\./.test(t)) return false;
+    if (!/^\d[\d.\-\/\s]*$/.test(t)) return false;
+    const digitos = t.replace(/\D/g, "");
+    return digitos.length >= 4 && digitos.length <= 14;
+  }
+
+  function ehCampoTexto(el) {
+    if (!el || el.nodeType !== 1) return false;
+    if (el.tagName === "TEXTAREA") return true;
+    if (el.tagName !== "INPUT") return false;
+    const tipo = (el.getAttribute("type") || "text").toLowerCase();
+    return (
+      tipo !== "hidden" &&
+      tipo !== "checkbox" &&
+      tipo !== "radio" &&
+      tipo !== "file" &&
+      tipo !== "password" &&
+      tipo !== "button" &&
+      tipo !== "submit" &&
+      tipo !== "reset" &&
+      tipo !== "image" &&
+      tipo !== "range" &&
+      tipo !== "color"
+    );
+  }
+
+  function textoMascaraCampo(el) {
+    const bruto = String(el.value == null ? "" : el.value);
+    if (!bruto) return "";
+    const rotulo = rotuloVisivel(el);
+    const porRotulo = labelDeCampoSensivel(rotulo);
+    const porMascara = pareceMascaraCpfCnpj(bruto);
+    if (!porRotulo && !porMascara) {
+      const padrao = censurarTexto(bruto);
+      return padrao === bruto ? "" : padrao;
+    }
+    const t = semAcento(rotulo);
+    if (
+      porMascara ||
+      t.indexOf("cpf") !== -1 ||
+      t.indexOf("cnpj") !== -1
+    ) {
+      const doc = mascararDocumento(bruto);
+      return doc === bruto ? "" : doc;
+    }
+    const s = censurarTexto(mascararNPalavras(bruto, 3));
+    return s === bruto ? "" : s;
+  }
+
+  function desenharMascara(txt, bruto, mascara, cor) {
+    if (
+      txt.getAttribute("data-v") === bruto &&
+      txt.getAttribute("data-c") === cor
+    )
+      return;
+    txt.setAttribute("data-v", bruto);
+    txt.setAttribute("data-c", cor);
+    txt.textContent = "";
+    if (mascara.length !== bruto.length) {
+      txt.style.color = cor;
+      txt.textContent = mascara;
+      return;
+    }
+    for (let i = 0; i < bruto.length; i++) {
+      const ch = bruto.charAt(i);
+      const vis = mascara.charAt(i);
+      const slot = document.createElement("span");
+      slot.style.position = "relative";
+      slot.style.display = "inline-block";
+      slot.style.whiteSpace = "pre";
+      const base = document.createElement("span");
+      base.textContent = ch;
+      slot.appendChild(base);
+      if (vis === ch) {
+        base.style.color = cor;
+      } else {
+        base.style.visibility = "hidden";
+        const ast = document.createElement("span");
+        ast.textContent = vis;
+        ast.style.position = "absolute";
+        ast.style.left = "0";
+        ast.style.top = "0";
+        ast.style.color = cor;
+        slot.appendChild(ast);
+      }
+      txt.appendChild(slot);
+    }
+  }
+
+  function guardarCor(el) {
+    if (coresCampo.has(el)) return;
+    const c = window.getComputedStyle(el).color;
+    if (!c || c === "transparent" || c === "rgba(0, 0, 0, 0)") return;
+    coresCampo.set(el, c);
+  }
+
+  function esconderTexto(el) {
+    el.classList.add(CLASSE_CAMPO);
+    el.style.setProperty("color", "transparent", "important");
+    el.style.setProperty("-webkit-text-fill-color", "transparent", "important");
+    el.style.setProperty(
+      "caret-color",
+      coresCampo.get(el) || "#222",
+      "important",
+    );
+  }
+
+  function restaurarTexto(el) {
+    el.classList.remove(CLASSE_CAMPO);
+    el.style.removeProperty("color");
+    el.style.removeProperty("-webkit-text-fill-color");
+    el.style.removeProperty("caret-color");
+  }
+
+  function removerMascara(el) {
+    restaurarTexto(el);
+    const cob = mascarasCampo.get(el);
+    if (cob && cob.parentNode) cob.remove();
+    mascarasCampo.delete(el);
+    camposMascarados.delete(el);
+  }
+
+  function garantirMascara(el) {
+    const pai = el.parentElement;
+    if (!pai) return null;
+    let cob = mascarasCampo.get(el);
+    if (cob && cob.isConnected && cob.parentNode === pai) return cob;
+    if (cob && cob.parentNode) cob.remove();
+    if (window.getComputedStyle(pai).position === "static")
+      pai.style.position = "relative";
+    cob = document.createElement("div");
+    cob.className = CLASSE_MASCARA;
+    cob.setAttribute("aria-hidden", "true");
+    const txt = document.createElement("span");
+    cob.appendChild(txt);
+    pai.insertBefore(cob, el.nextSibling);
+    mascarasCampo.set(el, cob);
+    camposMascarados.add(el);
+    return cob;
+  }
+
+  function posicionarMascara(el, cob) {
+    const pai = el.parentElement;
+    if (!pai || !el.isConnected || !campoVisivel(el)) {
+      cob.style.display = "none";
+      return;
+    }
+    const cs = window.getComputedStyle(el);
+    const bl = parseFloat(cs.borderLeftWidth) || 0;
+    const bt = parseFloat(cs.borderTopWidth) || 0;
+    const br = parseFloat(cs.borderRightWidth) || 0;
+    const bb = parseFloat(cs.borderBottomWidth) || 0;
+    cob.style.display = "flex";
+    cob.style.position = "absolute";
+    cob.style.left = el.offsetLeft + bl + "px";
+    cob.style.top = el.offsetTop + bt + "px";
+    cob.style.width = el.offsetWidth - bl - br + "px";
+    cob.style.height = el.offsetHeight - bt - bb + "px";
+    cob.style.zIndex = "2";
+    cob.style.pointerEvents = "none";
+    cob.style.boxSizing = "border-box";
+    cob.style.margin = "0";
+    cob.style.overflow = "hidden";
+    cob.style.background = "transparent";
+    cob.style.border = "0";
+    cob.style.padding = cs.padding;
+    cob.style.alignItems = el.tagName === "TEXTAREA" ? "flex-start" : "center";
+    cob.style.justifyContent =
+      cs.textAlign === "right" || cs.textAlign === "end"
+        ? "flex-end"
+        : cs.textAlign === "center"
+          ? "center"
+          : "flex-start";
+    const txt = cob.firstChild;
+    if (!txt) return;
+    txt.style.font = cs.font;
+    txt.style.letterSpacing = cs.letterSpacing;
+    txt.style.lineHeight = cs.lineHeight;
+    txt.style.color = coresCampo.get(el) || "#222";
+    txt.style.whiteSpace = el.tagName === "TEXTAREA" ? "pre-wrap" : "pre";
+    txt.style.transform =
+      "translate(" + (-el.scrollLeft) + "px," + (-el.scrollTop) + "px)";
   }
 
   function ehMarca(node) {
@@ -230,9 +489,42 @@ const MARCA_DAGUA = true;
     if (!node || ehMarca(node)) return true;
     const el = node.nodeType === 1 ? node : node.parentElement;
     if (!el || !el.closest) return true;
-    return Boolean(
-      el.closest("script, style, noscript, " + seletorClassesBlur()),
-    );
+    if (el.closest("." + CLASSE_MASCARA)) return true;
+    const extra = seletorClassesBlur();
+    const sel = extra
+      ? "script, style, noscript, " + extra
+      : "script, style, noscript";
+    try {
+      return Boolean(el.closest(sel));
+    } catch (e) {
+      return Boolean(el.closest("script, style, noscript"));
+    }
+  }
+
+  function ehNomeDeCampo(el) {
+    if (!el || !el.closest) return false;
+    const tag = el.tagName;
+    if (
+      tag === "LABEL" ||
+      tag === "LEGEND" ||
+      tag === "DT" ||
+      tag === "TH" ||
+      tag === "H1" ||
+      tag === "H2" ||
+      tag === "H3" ||
+      tag === "H4" ||
+      tag === "H5" ||
+      tag === "H6"
+    )
+      return true;
+    return Boolean(el.closest("label, legend"));
+  }
+
+  function textoEhSoRotulo(texto) {
+    const t = String(texto || "").trim();
+    if (!t || t.length > 24 || /\d/.test(t)) return false;
+    const sem = semAcento(t).replace(/[^a-z]/g, "");
+    return sem === "cpf" || sem === "cnpj" || sem === "cpfcnpj";
   }
 
   function aplicarNoTexto(node) {
@@ -247,39 +539,165 @@ const MARCA_DAGUA = true;
       ? originaisTexto.get(node)
       : atual;
     let saida = candidato;
-    if (contextoSensivel(pai)) saida = mascararNPalavras(saida, 3);
+    if (
+      !ehNomeDeCampo(pai) &&
+      !textoEhSoRotulo(candidato) &&
+      contextoSensivel(pai)
+    )
+      saida = mascararNPalavras(saida, 3);
     saida = censurarTexto(saida);
-    if (saida !== candidato) {
-      originaisTexto.set(node, candidato);
-      if (atual !== saida) node.nodeValue = saida;
+    if (saida !== atual) {
+      if (saida !== candidato) originaisTexto.set(node, candidato);
+      else originaisTexto.delete(node);
+      node.nodeValue = saida;
       return;
     }
-    if (originaisTexto.has(node) && atual === originaisTexto.get(node)) {
-      originaisTexto.delete(node);
+    if (originaisTexto.has(node) && atual === candidato) originaisTexto.delete(node);
+  }
+
+  function campoVisivel(el) {
+    if (!el || !el.isConnected || el.hidden) return false;
+    if (el.getAttribute("aria-hidden") === "true") return false;
+    const cs = window.getComputedStyle(el);
+    if (
+      cs.display === "none" ||
+      cs.visibility === "hidden" ||
+      parseFloat(cs.opacity) === 0
+    )
+      return false;
+    const r = el.getBoundingClientRect();
+    if (r.width < 8 || r.height < 8) return false;
+    let node = el.parentElement;
+    while (node && node !== document.documentElement) {
+      if (node.hidden || node.getAttribute("aria-hidden") === "true")
+        return false;
+      const st = window.getComputedStyle(node);
+      if (
+        st.display === "none" ||
+        st.visibility === "hidden" ||
+        parseFloat(st.opacity) === 0
+      )
+        return false;
+      node = node.parentElement;
     }
+    return true;
   }
 
   function aplicarNoCampo(el) {
-    if (!el || ignorarNo(el)) return;
-    const atual = el.value;
-    if (atual == null) return;
-    let bruto = originaisCampo.has(el) ? originaisCampo.get(el) : atual;
-    const mascaradoAtual = mascararValor(el, bruto);
-    if (atual !== bruto && atual !== mascaradoAtual) {
-      bruto = atual;
-    }
-    const saida = mascararValor(el, bruto);
-    if (saida === bruto) {
-      if (originaisCampo.has(el) && atual === originaisCampo.get(el))
-        originaisCampo.delete(el);
+    if (aplicandoCampo || !ehCampoTexto(el) || ignorarNo(el)) return;
+    if (!campoVisivel(el)) {
+      removerMascara(el);
       return;
     }
-    originaisCampo.set(el, bruto);
-    if (atual !== saida) el.value = saida;
+    aplicandoCampo = true;
+    try {
+      const mascara = textoMascaraCampo(el);
+      if (!mascara) {
+        removerMascara(el);
+        return;
+      }
+      guardarCor(el);
+      esconderTexto(el);
+      const cob = garantirMascara(el);
+      if (!cob) return;
+      const txt = cob.firstChild;
+      if (txt)
+        desenharMascara(
+          txt,
+          String(el.value || ""),
+          mascara,
+          coresCampo.get(el) || "#222",
+        );
+      posicionarMascara(el, cob);
+    } finally {
+      aplicandoCampo = false;
+    }
+  }
+
+  function campoDeveAcompanhar(el) {
+    if (!ehCampoTexto(el)) return false;
+    if (mascarasCampo.has(el)) return true;
+    if (labelDeCampoSensivel(rotuloVisivel(el))) return true;
+    return pareceMascaraCpfCnpj(el.value);
+  }
+
+  function agendarLoop() {
+    if (loopOn) return;
+    loopOn = true;
+    function tick() {
+      const el = document.activeElement;
+      if (!campoDeveAcompanhar(el)) {
+        loopOn = false;
+        return;
+      }
+      aplicarNoCampo(el);
+      if (document.activeElement === el && campoDeveAcompanhar(el))
+        window.requestAnimationFrame(tick);
+      else loopOn = false;
+    }
+    window.requestAnimationFrame(tick);
+  }
+
+  function limparMascarasSoltas() {
+    camposMascarados.forEach(function (el) {
+      if (!el.isConnected || !campoVisivel(el)) removerMascara(el);
+    });
+    const soltas = document.querySelectorAll("body > ." + CLASSE_MASCARA);
+    for (let i = 0; i < soltas.length; i++) soltas[i].remove();
+  }
+
+  function soltarCampos(node) {
+    if (!node || node.nodeType !== 1) return;
+    if (ehCampoTexto(node)) removerMascara(node);
+    if (!node.querySelectorAll) return;
+    const lista = node.querySelectorAll("input, textarea");
+    for (let i = 0; i < lista.length; i++) removerMascara(lista[i]);
+  }
+
+  function reposicionarMascaras() {
+    limparMascarasSoltas();
+    camposMascarados.forEach(function (el) {
+      const cob = mascarasCampo.get(el);
+      if (cob) posicionarMascara(el, cob);
+    });
+  }
+
+  function vigiarValor(proto) {
+    try {
+      const desc = Object.getOwnPropertyDescriptor(proto, "value");
+      if (!desc || !desc.get || !desc.set || !desc.configurable) return;
+      if (desc.set._abnt) return;
+      function set(v) {
+        desc.set.call(this, v);
+        if (aplicandoCampo) return;
+        if (
+          this !== document.activeElement &&
+          !mascarasCampo.has(this) &&
+          !this.classList.contains(CLASSE_CAMPO)
+        )
+          return;
+        aplicarNoCampo(this);
+      }
+      set._abnt = true;
+      Object.defineProperty(proto, "value", {
+        configurable: true,
+        enumerable: desc.enumerable,
+        get: function () {
+          return desc.get.call(this);
+        },
+        set: set,
+      });
+    } catch (e) {}
   }
 
   function varrer(raiz) {
     if (!raiz || ehMarca(raiz)) return;
+    if (
+      raiz === document ||
+      raiz === document.body ||
+      raiz === document.documentElement
+    )
+      limparMascarasSoltas();
     if (raiz.nodeType === 3) {
       aplicarNoTexto(raiz);
       return;
@@ -412,37 +830,56 @@ const MARCA_DAGUA = true;
       "{position:absolute;inset:0;z-index:2147483645;backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);background:rgba(255,255,255,0.28);pointer-events:none}" +
       "." +
       ACAO_BLUR +
-      "{position:absolute;top:8px;left:50%;transform:translateX(-50%);z-index:2;pointer-events:auto;border:0;border-radius:4px;padding:6px 12px;background:#1a1a1a;color:#fff;font:600 13px/1.2 Arial,Helvetica,sans-serif;cursor:pointer}";
-    if (MARCA_DAGUA) css +=
-      "#" +
-      MARCA_ID +
-      "{position:fixed;inset:0;z-index:2147483647;pointer-events:none;overflow:hidden;user-select:none;-webkit-user-select:none;background:transparent !important;opacity:.4 !important;--gbr-linhas:2;--gbr-vert:2}" +
-      ".gbr-ap-logos{position:absolute;inset:0;display:grid;place-items:center;color:#2F92D0}" +
-      ".gbr-ap-logos .gbr-ap-logo{width:100%;height:100%;display:flex;align-items:center;justify-content:center;overflow:visible}" +
-      ".gbr-ap-logos .gbr-ap-logo svg{width:min(32vw,320px);height:auto;display:block;transform:rotate(-45deg);transform-origin:center}" +
-      ".gbr-ap-vert{position:absolute;inset:0 1.5% 0 1.5%;display:flex;justify-content:space-between;z-index:1;color:#1a1a1a}" +
-      ".gbr-ap-vert-col{width:12%;height:100%;display:flex;flex-direction:column;justify-content:space-evenly;align-items:center;padding:4vh 0;box-sizing:border-box}" +
-      ".gbr-ap-vert-col span{writing-mode:vertical-rl;font-family:Arial,Helvetica,sans-serif;font-weight:800;letter-spacing:.04em;line-height:1.15;white-space:nowrap;max-height:42%;font-size:clamp(11px,calc(100vh / var(--gbr-vert) * 0.032),16px)}" +
-      ".gbr-ap-avisos{position:absolute;inset:0;display:grid;z-index:2}" +
-      "#" +
-      MARCA_ID +
-      "[data-vert='1'] .gbr-ap-avisos{left:13%;right:13%}" +
-      ".gbr-ap-selo{height:100%;min-height:0;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:1.5% 3%;box-sizing:border-box;color:#1a1a1a;font-family:Arial,Helvetica,sans-serif;overflow:hidden}" +
-      ".gbr-ap-escudo{width:clamp(18px,calc(100vh / var(--gbr-linhas) * 0.07),36px);height:auto;color:#8b929a;margin:0 0 .25rem;flex:0 0 auto}" +
-      ".gbr-ap-t1,.gbr-ap-t2,.gbr-ap-t3{font-weight:800;letter-spacing:-.03em;line-height:1.12;max-width:100%;white-space:nowrap;flex:0 0 auto}" +
-      ".gbr-ap-t1{font-size:clamp(13px,calc(100vh / var(--gbr-linhas) * 0.085),38px)}" +
-      ".gbr-ap-t2,.gbr-ap-t3{font-size:clamp(12px,calc(100vh / var(--gbr-linhas) * 0.07),32px);margin-top:.16rem}" +
-      "#" +
-      MARCA_ID +
-      "[data-cols='1'] .gbr-ap-t1{font-size:clamp(15px,4.2vw,36px)}" +
-      "#" +
-      MARCA_ID +
-      "[data-cols='1'] .gbr-ap-t2,#" +
-      MARCA_ID +
-      "[data-cols='1'] .gbr-ap-t3{font-size:clamp(13px,3.5vw,30px)}" +
-      ".gbr-ap-rodape{margin-top:.4rem;max-width:24em;color:#8e959d;font-weight:600;font-size:clamp(10px,calc(100vh / var(--gbr-linhas) * 0.04),16px);line-height:1.25;flex:0 0 auto}" +
-      ".gbr-ap-selo-logo{width:min(48%,220px);height:auto;max-height:14%;margin-top:.35rem;flex:0 1 auto;color:#2F92D0}" +
-      ".gbr-ap-selo-logo svg{width:100%;height:auto;display:block}";
+      "{position:absolute;top:8px;left:50%;transform:translateX(-50%);z-index:2;pointer-events:auto;border:0;border-radius:4px;padding:6px 12px;background:#1a1a1a;color:#fff;font:600 13px/1.2 Arial,Helvetica,sans-serif;cursor:pointer}" +
+      "input." +
+      CLASSE_CAMPO +
+      ",textarea." +
+      CLASSE_CAMPO +
+      "{color:transparent !important;-webkit-text-fill-color:transparent !important;caret-color:#222 !important}" +
+      "input." +
+      CLASSE_CAMPO +
+      "::selection,textarea." +
+      CLASSE_CAMPO +
+      "::selection{color:transparent !important;-webkit-text-fill-color:transparent !important;background:transparent}" +
+      "input." +
+      CLASSE_CAMPO +
+      ":-webkit-autofill,textarea." +
+      CLASSE_CAMPO +
+      ":-webkit-autofill{-webkit-text-fill-color:transparent !important}" +
+      "." +
+      CLASSE_MASCARA +
+      "{position:absolute;z-index:2;margin:0;pointer-events:none;overflow:hidden;background:transparent;border:0;user-select:none;box-sizing:border-box}";
+    if (MARCA_DAGUA)
+      css +=
+        "#" +
+        MARCA_ID +
+        "{position:fixed;inset:0;z-index:2147483647;pointer-events:none;overflow:hidden;user-select:none;-webkit-user-select:none;background:transparent !important;opacity:.4 !important;--gbr-linhas:2;--gbr-vert:2}" +
+        ".gbr-ap-logos{position:absolute;inset:0;display:grid;place-items:center;color:#2F92D0}" +
+        ".gbr-ap-logos .gbr-ap-logo{width:100%;height:100%;display:flex;align-items:center;justify-content:center;overflow:visible}" +
+        ".gbr-ap-logos .gbr-ap-logo svg{width:min(32vw,320px);height:auto;display:block;transform:rotate(-45deg);transform-origin:center}" +
+        ".gbr-ap-vert{position:absolute;inset:0 1.5% 0 1.5%;display:flex;justify-content:space-between;z-index:1;color:#1a1a1a}" +
+        ".gbr-ap-vert-col{width:12%;height:100%;display:flex;flex-direction:column;justify-content:space-evenly;align-items:center;padding:4vh 0;box-sizing:border-box}" +
+        ".gbr-ap-vert-col span{writing-mode:vertical-rl;font-family:Arial,Helvetica,sans-serif;font-weight:800;letter-spacing:.04em;line-height:1.15;white-space:nowrap;max-height:42%;font-size:clamp(11px,calc(100vh / var(--gbr-vert) * 0.032),16px)}" +
+        ".gbr-ap-avisos{position:absolute;inset:0;display:grid;z-index:2}" +
+        "#" +
+        MARCA_ID +
+        "[data-vert='1'] .gbr-ap-avisos{left:13%;right:13%}" +
+        ".gbr-ap-selo{height:100%;min-height:0;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:1.5% 3%;box-sizing:border-box;color:#1a1a1a;font-family:Arial,Helvetica,sans-serif;overflow:hidden}" +
+        ".gbr-ap-escudo{width:clamp(18px,calc(100vh / var(--gbr-linhas) * 0.07),36px);height:auto;color:#8b929a;margin:0 0 .25rem;flex:0 0 auto}" +
+        ".gbr-ap-t1,.gbr-ap-t2,.gbr-ap-t3{font-weight:800;letter-spacing:-.03em;line-height:1.12;max-width:100%;white-space:nowrap;flex:0 0 auto}" +
+        ".gbr-ap-t1{font-size:clamp(13px,calc(100vh / var(--gbr-linhas) * 0.085),38px)}" +
+        ".gbr-ap-t2,.gbr-ap-t3{font-size:clamp(12px,calc(100vh / var(--gbr-linhas) * 0.07),32px);margin-top:.16rem}" +
+        "#" +
+        MARCA_ID +
+        "[data-cols='1'] .gbr-ap-t1{font-size:clamp(15px,4.2vw,36px)}" +
+        "#" +
+        MARCA_ID +
+        "[data-cols='1'] .gbr-ap-t2,#" +
+        MARCA_ID +
+        "[data-cols='1'] .gbr-ap-t3{font-size:clamp(13px,3.5vw,30px)}" +
+        ".gbr-ap-rodape{margin-top:.4rem;max-width:24em;color:#8e959d;font-weight:600;font-size:clamp(10px,calc(100vh / var(--gbr-linhas) * 0.04),16px);line-height:1.25;flex:0 0 auto}" +
+        ".gbr-ap-selo-logo{width:min(48%,220px);height:auto;max-height:14%;margin-top:.35rem;flex:0 1 auto;color:#2F92D0}" +
+        ".gbr-ap-selo-logo svg{width:100%;height:auto;display:block}";
     if (typeof GM_addStyle === "function") {
       GM_addStyle(css);
       return;
@@ -614,13 +1051,43 @@ const MARCA_DAGUA = true;
   function iniciar() {
     garantirEstilos();
     if (MARCA_DAGUA) garantirMarca();
+    vigiarValor(HTMLInputElement.prototype);
+    vigiarValor(HTMLTextAreaElement.prototype);
     varrer(document.body);
+    function aoEditarCampo(ev) {
+      const el = ev.target;
+      if (!ehCampoTexto(el)) return;
+      aplicarNoCampo(el);
+      if (campoDeveAcompanhar(el)) agendarLoop();
+    }
+    document.addEventListener(
+      "beforeinput",
+      function (ev) {
+        const el = ev.target;
+        if (!campoDeveAcompanhar(el)) return;
+        guardarCor(el);
+        esconderTexto(el);
+        agendarLoop();
+      },
+      true,
+    );
+    document.addEventListener("input", aoEditarCampo, true);
+    document.addEventListener("input", aoEditarCampo, false);
+    document.addEventListener("keydown", aoEditarCampo, false);
+    document.addEventListener("keyup", aoEditarCampo, false);
+    document.addEventListener("focusin", aoEditarCampo, true);
+    window.addEventListener("scroll", reposicionarMascaras, true);
+    window.addEventListener("resize", reposicionarMascaras);
+    window.addEventListener("hashchange", limparMascarasSoltas);
+    window.addEventListener("popstate", limparMascarasSoltas);
     const obs = new MutationObserver(function (muts) {
       for (let i = 0; i < muts.length; i++) {
         const m = muts[i];
         if (m.type === "characterData") {
           if (!ehMarca(m.target)) aplicarNoTexto(m.target);
         }
+        const fora = m.removedNodes;
+        for (let k = 0; k < fora.length; k++) soltarCampos(fora[k]);
         const nos = m.addedNodes;
         for (let j = 0; j < nos.length; j++) {
           const n = nos[j];
@@ -629,6 +1096,7 @@ const MARCA_DAGUA = true;
           else if (n.nodeType === 1) varrer(n);
         }
       }
+      limparMascarasSoltas();
       if (MARCA_DAGUA && !document.getElementById(MARCA_ID)) garantirMarca();
     });
     obs.observe(document.documentElement, {
@@ -668,7 +1136,8 @@ const MARCA_DAGUA = true;
           method: "GET",
           url: alvo,
           onload: function (res) {
-            if (res.status >= 200 && res.status < 300) resolve(res.responseText);
+            if (res.status >= 200 && res.status < 300)
+              resolve(res.responseText);
             else reject(new Error(url + " " + res.status));
           },
           onerror: function () {
@@ -677,10 +1146,12 @@ const MARCA_DAGUA = true;
         });
         return;
       }
-      fetch(alvo, { cache: "no-store" }).then(function (res) {
-        if (!res.ok) throw new Error(url + " " + res.status);
-        return res.text();
-      }).then(resolve, reject);
+      fetch(alvo, { cache: "no-store" })
+        .then(function (res) {
+          if (!res.ok) throw new Error(url + " " + res.status);
+          return res.text();
+        })
+        .then(resolve, reject);
     });
   }
 
