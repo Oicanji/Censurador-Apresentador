@@ -5,3 +5,6 @@ interessados
 atual
 CPF/CNPJ:
 CPF/CNPJ
+CPF
+nome
+empresa
