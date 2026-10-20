@@ -11,3 +11,6 @@ Cadastrado
 Cadastrado por:
 Nome:
 E-mail:
+CRM:
+Diretor Técnico
+Endereço
