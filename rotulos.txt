@@ -1,11 +1,7 @@
 denunciante
 denunciado
-interessado
-interessados
 atual
 CPF/CNPJ:
-CPF/CNPJ
-CPF
 nome
 empresa
 Cadastrado por
@@ -14,5 +10,4 @@ Conselheiro
 Cadastrado
 Cadastrado por:
 Nome:
-Email:
 E-mail:
