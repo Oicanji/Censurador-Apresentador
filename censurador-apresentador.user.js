@@ -1,13 +1,14 @@
 // ==UserScript==
 // @name         CRM SC/RS - Censurador Apresentador
 // @namespace    censurador-apresentador
-// @version      1.6.1
+// @version      1.7.0
 // @description  Censura dados sensíveis e cobre a tela com marca d'água da GBR
 // @match        https://apps.crmsc.org.br/*
 // @match        https://crvirtual-hml.crmsc.org.br/*
 // @match        https://servicos.cremers.org.br/*
 // @match        http://localhost
 // @grant        GM_addStyle
+// @grant        GM_setClipboard
 // @grant        GM_xmlhttpRequest
 // @connect      raw.githubusercontent.com
 // @run-at       document-idle
@@ -36,12 +37,17 @@ const MARCA_DAGUA = false;
   const ACAO_BLUR = "abnt-pasta-acao";
   const CLASSE_CAMPO = "abnt-campo-censura";
   const CLASSE_MASCARA = "abnt-campo-ast";
+  const CLASSE_OLHO = "abnt-olho";
   const pastasSemBlur = new WeakSet();
 
   const originaisTexto = new WeakMap();
   const mascarasCampo = new WeakMap();
   const coresCampo = new WeakMap();
   const camposMascarados = new Set();
+  const olhosTexto = new WeakMap();
+  const olhosCampo = new WeakMap();
+  const textosRevelados = new WeakSet();
+  const camposRevelados = new WeakSet();
   let aplicandoCampo = false;
   let loopOn = false;
 
@@ -410,6 +416,7 @@ const MARCA_DAGUA = false;
 
   function removerMascara(el) {
     restaurarTexto(el);
+    removerOlhoCampo(el);
     const cob = mascarasCampo.get(el);
     if (cob && cob.parentNode) cob.remove();
     mascarasCampo.delete(el);
@@ -450,7 +457,7 @@ const MARCA_DAGUA = false;
     cob.style.position = "absolute";
     cob.style.left = el.offsetLeft + bl + "px";
     cob.style.top = el.offsetTop + bt + "px";
-    cob.style.width = el.offsetWidth - bl - br + "px";
+    cob.style.width = Math.max(0, el.offsetWidth - bl - br - 26) + "px";
     cob.style.height = el.offsetHeight - bt - bb + "px";
     cob.style.zIndex = "2";
     cob.style.pointerEvents = "none";
@@ -489,7 +496,7 @@ const MARCA_DAGUA = false;
     if (!node || ehMarca(node)) return true;
     const el = node.nodeType === 1 ? node : node.parentElement;
     if (!el || !el.closest) return true;
-    if (el.closest("." + CLASSE_MASCARA)) return true;
+    if (el.closest("." + CLASSE_MASCARA + ", ." + CLASSE_OLHO)) return true;
     const extra = seletorClassesBlur();
     const sel = extra
       ? "script, style, noscript, " + extra
@@ -527,6 +534,136 @@ const MARCA_DAGUA = false;
     return sem === "cpf" || sem === "cnpj" || sem === "cpfcnpj";
   }
 
+  function svgOlho() {
+    return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="2"/></svg>';
+  }
+
+  function copiarPorSelecao(valor) {
+    const ta = document.createElement("textarea");
+    ta.value = valor;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.left = "-9999px";
+    document.body.appendChild(ta);
+    ta.select();
+    try {
+      document.execCommand("copy");
+    } catch (e) {}
+    ta.remove();
+  }
+
+  function copiarTexto(texto) {
+    const valor = String(texto || "");
+    if (typeof GM_setClipboard === "function") {
+      try {
+        GM_setClipboard(valor, "text");
+        return;
+      } catch (e) {}
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(valor).catch(function () {
+        copiarPorSelecao(valor);
+      });
+      return;
+    }
+    copiarPorSelecao(valor);
+  }
+
+  function criarOlho(aoClicar) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = CLASSE_OLHO;
+    btn.setAttribute("aria-label", "Mostrar e copiar");
+    btn.innerHTML = svgOlho();
+    btn.addEventListener("click", function (ev) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      aoClicar(btn);
+    });
+    return btn;
+  }
+
+  function removerOlhoTexto(node) {
+    const btn = olhosTexto.get(node);
+    if (btn && btn.parentNode) btn.remove();
+    olhosTexto.delete(node);
+    textosRevelados.delete(node);
+  }
+
+  function garantirOlhoTexto(node) {
+    const pai = node.parentElement;
+    if (!pai) return;
+    let btn = olhosTexto.get(node);
+    if (btn && btn.isConnected && btn.previousSibling === node) return;
+    if (btn && btn.parentNode) btn.remove();
+    btn = criarOlho(function (b) {
+      const original = originaisTexto.get(node);
+      if (original == null) return;
+      if (textosRevelados.has(node)) {
+        textosRevelados.delete(node);
+        b.classList.remove(CLASSE_OLHO + "-aberto");
+        aplicarNoTexto(node);
+        return;
+      }
+      textosRevelados.add(node);
+      node.nodeValue = original;
+      b.classList.add(CLASSE_OLHO + "-aberto");
+      copiarTexto(original);
+    });
+    if (textosRevelados.has(node)) btn.classList.add(CLASSE_OLHO + "-aberto");
+    if (node.nextSibling) pai.insertBefore(btn, node.nextSibling);
+    else pai.appendChild(btn);
+    olhosTexto.set(node, btn);
+  }
+
+  function removerOlhoCampo(el) {
+    const btn = olhosCampo.get(el);
+    if (btn && btn.parentNode) btn.remove();
+    olhosCampo.delete(el);
+    camposRevelados.delete(el);
+  }
+
+  function posicionarOlhoCampo(el, btn) {
+    btn.style.position = "absolute";
+    btn.style.margin = "0";
+    btn.style.left = el.offsetLeft + el.offsetWidth - 26 + "px";
+    btn.style.top = el.offsetTop + Math.max(0, (el.offsetHeight - 22) / 2) + "px";
+    btn.style.zIndex = "3";
+  }
+
+  function garantirOlhoCampo(el) {
+    const pai = el.parentElement;
+    if (!pai) return null;
+    let btn = olhosCampo.get(el);
+    if (btn && btn.isConnected && btn.parentNode === pai) {
+      posicionarOlhoCampo(el, btn);
+      return btn;
+    }
+    if (btn && btn.parentNode) btn.remove();
+    if (window.getComputedStyle(pai).position === "static")
+      pai.style.position = "relative";
+    btn = criarOlho(function (b) {
+      const valor = String(el.value || "");
+      if (camposRevelados.has(el)) {
+        camposRevelados.delete(el);
+        b.classList.remove(CLASSE_OLHO + "-aberto");
+        aplicarNoCampo(el);
+        return;
+      }
+      camposRevelados.add(el);
+      b.classList.add(CLASSE_OLHO + "-aberto");
+      const cob = mascarasCampo.get(el);
+      if (cob) cob.style.display = "none";
+      restaurarTexto(el);
+      copiarTexto(valor);
+    });
+    if (camposRevelados.has(el)) btn.classList.add(CLASSE_OLHO + "-aberto");
+    pai.insertBefore(btn, el.nextSibling);
+    olhosCampo.set(el, btn);
+    posicionarOlhoCampo(el, btn);
+    return btn;
+  }
+
   function aplicarNoTexto(node) {
     if (!node || node.nodeType !== 3) return;
     if (ignorarNo(node)) return;
@@ -534,6 +671,12 @@ const MARCA_DAGUA = false;
     if (!pai) return;
     const tag = pai.tagName;
     if (tag === "SCRIPT" || tag === "STYLE" || tag === "NOSCRIPT") return;
+    if (textosRevelados.has(node)) {
+      const original = originaisTexto.get(node);
+      if (original != null && node.nodeValue !== original) node.nodeValue = original;
+      garantirOlhoTexto(node);
+      return;
+    }
     const atual = node.nodeValue;
     const candidato = originaisTexto.has(node)
       ? originaisTexto.get(node)
@@ -546,13 +689,14 @@ const MARCA_DAGUA = false;
     )
       saida = mascararNPalavras(saida, 3);
     saida = censurarTexto(saida);
-    if (saida !== atual) {
-      if (saida !== candidato) originaisTexto.set(node, candidato);
-      else originaisTexto.delete(node);
-      node.nodeValue = saida;
+    if (saida !== candidato) {
+      originaisTexto.set(node, candidato);
+      if (atual !== saida) node.nodeValue = saida;
+      garantirOlhoTexto(node);
       return;
     }
-    if (originaisTexto.has(node) && atual === candidato) originaisTexto.delete(node);
+    removerOlhoTexto(node);
+    if (originaisTexto.has(node)) originaisTexto.delete(node);
   }
 
   function campoVisivel(el) {
@@ -596,6 +740,13 @@ const MARCA_DAGUA = false;
         removerMascara(el);
         return;
       }
+      if (camposRevelados.has(el)) {
+        const cobOculta = mascarasCampo.get(el);
+        if (cobOculta) cobOculta.style.display = "none";
+        restaurarTexto(el);
+        garantirOlhoCampo(el);
+        return;
+      }
       guardarCor(el);
       esconderTexto(el);
       const cob = garantirMascara(el);
@@ -609,6 +760,7 @@ const MARCA_DAGUA = false;
           coresCampo.get(el) || "#222",
         );
       posicionarMascara(el, cob);
+      garantirOlhoCampo(el);
     } finally {
       aplicandoCampo = false;
     }
@@ -848,7 +1000,16 @@ const MARCA_DAGUA = false;
       ":-webkit-autofill{-webkit-text-fill-color:transparent !important}" +
       "." +
       CLASSE_MASCARA +
-      "{position:absolute;z-index:2;margin:0;pointer-events:none;overflow:hidden;background:transparent;border:0;user-select:none;box-sizing:border-box}";
+      "{position:absolute;z-index:2;margin:0;pointer-events:none;overflow:hidden;background:transparent;border:0;user-select:none;box-sizing:border-box}" +
+      "." +
+      CLASSE_OLHO +
+      "{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;margin:0 0 0 4px;padding:0;border:0;border-radius:4px;background:transparent;color:#3a3a3a;cursor:pointer;vertical-align:middle;line-height:0}" +
+      "." +
+      CLASSE_OLHO +
+      " svg{display:block;width:16px;height:16px;pointer-events:none}" +
+      "." +
+      CLASSE_OLHO +
+      "-aberto{color:#1a73e8}";
     if (MARCA_DAGUA)
       css +=
         "#" +
