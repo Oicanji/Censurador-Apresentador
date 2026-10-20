@@ -8,3 +8,6 @@ CPF/CNPJ
 CPF
 nome
 empresa
+Cadastrado por
+E-mail do Diretor Técnico
+Conselheiro
